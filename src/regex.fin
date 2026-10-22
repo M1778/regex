@@ -1,0 +1,1439 @@
+// regex — regular expressions for Fin.
+//
+// A small, correct, backtracking-free regex engine built on a Pike VM
+// (Thompson NFA simulation). No exponential blowup on nested quantifiers:
+// `(a+)+$` on a long non-matching string runs in linear time.
+//
+// Supported syntax (v0.1.0):
+//   literals, `.` (any char except \n), `* + ?` (greedy + lazy `*? +? ??`),
+//   `{m}`, `{m,}`, `{m,n}` bounded repetition (m <= 32, n <= 64),
+//   `[...]` classes with ranges, negation `[^...]`, `\d \w \s` inside
+//   classes, escapes `\d \D \w \W \s \S \n \r \t \b \B` plus `\` + any
+//   punctuation as a literal, groups `(...)` (capturing) and `(?:...)`
+//   (non-capturing), alternation `|`, anchors `^` (text start) and `$`
+//   (text end).
+// NOT in v0.1.0 (documented, will blame/err honestly): backreferences,
+// lookaround, POSIX classes, `\D \W \S` inside `[...]`, multiline mode,
+// Unicode properties. `.` never matches `\n`.
+//
+// Design notes (finc 0.4.0 backend, see builder NOTES.md):
+//   * No `const` anywhere in this module (limit #2) — op codes are plain
+//     int literals, documented below.
+//   * No `Collection<struct>` (limit #3) — threads are parallel
+//     `Collection<int>` (pcs) + `Collection<&Collection<int>>` (spans).
+//   * Only by-name imported calls (std helpers) are used; `regex` itself
+//     is pure Fin + vendored `calloc`/`free` (only `#[global]`-style
+//     externs lower through imports, and these two are declared here).
+//   * Groups are numbered by opening-paren order, group 0 = whole match.
+//     A group that did not participate reports start/end -1 and empty text.
+//   * Returned strings (`regex_group_text`, `regex_match_text`,
+//     `regex_replace_*`) are heap-allocated — free them with
+//     `strings::std.free_str` when done. Even the empty string is heap
+//     (calloc), so freeing is always safe. `Match.spans` is owned by the
+//     Match value; there is no free API for it in v0.1.0 (small, one
+//     collection per search — see README).
+
+import { Collection } from collection::std;
+import { len, to_chars, concat, substr } from strings::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Local C bindings (module-private, vendored like logg/zhttp).
+// ---------------------------------------------------------------------------
+
+#[llvm_name="calloc"]
+@define re_calloc(count: ulong, size: ulong) <string>;
+
+#[llvm_name="free"]
+@define re_cfree(p: string) <noret>;
+
+// ---------------------------------------------------------------------------
+// Instruction op codes (plain ints — no const in library modules).
+// ---------------------------------------------------------------------------
+//   0 CHAR   a1 = char code
+//   1 ANY    any char except '\n'
+//   2 CLASS  a1 = class id (see cls_* tables)
+//   3 SPLIT  a1, a2 = branch targets (priority: a1 first)
+//   4 JMP    a1 = target
+//   5 SAVE   a1 = span slot (group g -> slots 2g, 2g+1)
+//   6 BOL    text start (^)
+//   7 EOL    text end ($)
+//   8 WB     word boundary (\b)
+//   9 NWB    not a word boundary (\B)
+//  10 MATCH  accept
+
+// Compiled program. Internal only — never appears in an exported signature.
+struct ReProg {
+    pub:
+        ops <&Collection<int>>,
+        a1 <&Collection<int>>,
+        a2 <&Collection<int>>,
+        cls_start <&Collection<int>>,
+        cls_count <&Collection<int>>,
+        cls_neg <&Collection<int>>,
+        cls_ranges <&Collection<int>>,
+        ngroups <int>,
+        entry <int>,
+        err <int>,
+        errmsg <string>,
+}
+
+// A parsed fragment: emitted code starts at `start`, `pos` is the parser
+// position after the fragment. The fragment's dangling exit jumps — (pc,
+// arg) pairs that must be patched to whatever follows the fragment — are
+// appended to an `outs` collection the CALLER owns and passes in (a
+// finc escape-analysis quirk forbids returning a collection that was
+// assigned from another struct's field, so fragments never carry `outs`
+// as a struct field). Internal only.
+struct ReParsed {
+    pub:
+        pos <int>,
+        start <int>,
+}
+
+// Non-generic wrapper for an outs collection. Parser functions take
+// `&ReOuts` instead of `&Collection<int>` because finc 0.4.0 cannot
+// resolve a forward reference to a function whose signature contains a
+// generic type (measured 2026-10-21: `&Collection<int>` params break
+// forward calls, plain and user-struct params do not). The parser is
+// mutually recursive (alt -> concat -> piece -> atom -> alt), so the
+// wrapper is what makes the cycle compilable.
+struct ReOuts {
+    pub:
+        c <&Collection<int>>,
+}
+
+fun re_wrap(c: &Collection<int>) <&ReOuts> {
+    return new ReOuts{c: c};
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+fun re_new_outs() <&Collection<int>> {
+    return new Collection::<int>{};
+}
+
+fun re_outs_add(outs: &Collection<int>, pc: int, arg: int) <noret> {
+    outs.push(pc);
+    outs.push(arg);
+}
+
+// Index-assign through a parameter (NOT a struct field): finc 0.4.0 does
+// not lower `struct.field[i] = v` through a module import (measured
+// 2026-10-21), but the same store through a plain parameter lowers fine.
+fun re_coll_set(c: &Collection<int>, i: int, v: int) <noret> {
+    c[i] = v;
+}
+
+fun re_outs_append(dst: &Collection<int>, src: &Collection<int>) <noret> {
+    for (let i <int> = 0; i < src.len(); i++) {
+        dst.push(src.get(i));
+    }
+}
+
+fun re_emit(prog: &ReProg, op: int, x: int, y: int) <int> {
+    if (prog.ops.len() > 8192) {
+        prog.err = 3;
+        prog.errmsg = "regex: pattern too large (instruction cap)";
+        return prog.ops.len();
+    }
+    let pc <int> = prog.ops.len();
+    prog.ops.push(op);
+    prog.a1.push(x);
+    prog.a2.push(y);
+    return pc;
+}
+
+fun re_patch_single(prog: &ReProg, pc: int, arg: int, target: int) <noret> {
+    if (arg == 1) {
+        re_coll_set(prog.a1, pc, target);
+    } else {
+        re_coll_set(prog.a2, pc, target);
+    }
+}
+
+fun re_patch_outs(prog: &ReProg, outs: &Collection<int>, target: int) <noret> {
+    let i <int> = 0;
+    while (i < outs.len()) {
+        re_patch_single(prog, outs.get(i), outs.get(i + 1), target);
+        i = i + 2;
+    }
+}
+
+fun re_is_word(code: int) <bool> {
+    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
+           code == 95 || (code >= 97 && code <= 122);
+}
+
+fun re_is_boundary(tchars: [char], tlen: int, pos: int) <bool> {
+    let before <bool> = false;
+    let after <bool> = false;
+    if (pos > 0) {
+        before = re_is_word(cast<int>(tchars[pos - 1]));
+    }
+    if (pos < tlen) {
+        after = re_is_word(cast<int>(tchars[pos]));
+    }
+    return before != after;
+}
+
+// ---------------------------------------------------------------------------
+// Character classes
+// ---------------------------------------------------------------------------
+
+fun re_new_class(prog: &ReProg, neg: int) <int> {
+    let id <int> = prog.cls_start.len();
+    prog.cls_start.push(prog.cls_ranges.len());
+    prog.cls_count.push(0);
+    prog.cls_neg.push(neg);
+    return id;
+}
+
+fun re_class_add(prog: &ReProg, id: int, lo: int, hi: int) <noret> {
+    prog.cls_ranges.push(lo);
+    prog.cls_ranges.push(hi);
+    re_coll_set(prog.cls_count, id, prog.cls_count.get(id) + 1);
+}
+
+fun re_class_add_digit(prog: &ReProg, id: int) <noret> {
+    re_class_add(prog, id, 48, 57);
+}
+
+fun re_class_add_word(prog: &ReProg, id: int) <noret> {
+    re_class_add(prog, id, 48, 57);
+    re_class_add(prog, id, 65, 90);
+    re_class_add(prog, id, 95, 95);
+    re_class_add(prog, id, 97, 122);
+}
+
+fun re_class_add_space(prog: &ReProg, id: int) <noret> {
+    re_class_add(prog, id, 9, 13);
+    re_class_add(prog, id, 32, 32);
+}
+
+fun re_class_matches(prog: &ReProg, id: int, code: int) <bool> {
+    let start <int> = prog.cls_start.get(id);
+    let n <int> = prog.cls_count.get(id);
+    let hit <bool> = false;
+    for (let i <int> = 0; i < n; i++) {
+        let lo <int> = prog.cls_ranges.get(start + i * 2);
+        let hi <int> = prog.cls_ranges.get(start + i * 2 + 1);
+        if (code >= lo && code <= hi) {
+            hit = true;
+        }
+    }
+    if (prog.cls_neg.get(id) == 1) {
+        return !hit;
+    }
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Parser: alternation / concatenation / piece / atom
+//
+// Every parse function takes an `outs` collection (caller-owned, fresh)
+// and appends the fragment's dangling exit jumps — (pc, arg) pairs to be
+// patched to whatever follows the fragment — into it. It returns only
+// ints (pos, start), which keeps finc's escape analysis happy.
+// ---------------------------------------------------------------------------
+
+fun re_parse_alt(prog: &ReProg, pchars: [char], plen: int, pos: int, outs: &ReOuts) <ReParsed> {
+    // Scan ahead for a top-level '|' (respecting escapes, classes, nesting).
+    let has_alt <bool> = false;
+    let depth <int> = 0;
+    let i <int> = pos;
+    let scanning <bool> = true;
+    while (scanning && i < plen) {
+        let c <char> = pchars[i];
+        if (c == '\\') {
+            i = i + 2;
+        } else if (c == '[') {
+            i = i + 1;
+            if (i < plen && pchars[i] == '^') {
+                i = i + 1;
+            }
+            if (i < plen && pchars[i] == ']') {
+                i = i + 1;
+            }
+            let in_class <bool> = true;
+            while (in_class && i < plen) {
+                if (pchars[i] == '\\') {
+                    i = i + 2;
+                } else if (pchars[i] == ']') {
+                    i = i + 1;
+                    in_class = false;
+                } else {
+                    i = i + 1;
+                }
+            }
+        } else if (c == '(') {
+            depth = depth + 1;
+            i = i + 1;
+        } else if (c == ')') {
+            if (depth == 0) {
+                scanning = false;
+            } else {
+                depth = depth - 1;
+                i = i + 1;
+            }
+        } else if (c == '|' && depth == 0) {
+            has_alt = true;
+            scanning = false;
+        } else {
+            i = i + 1;
+        }
+    }
+    if (!has_alt) {
+        return re_parse_concat(prog, pchars, plen, pos, outs);
+    }
+    // Alternation, built in two phases. Phase 1 parses every branch
+    // (branch code is emitted in order). Phase 2 builds the SPLIT chain
+    // BACKWARDS: SPLIT_k chooses branch k vs the rest, and the LAST
+    // branch gets no split at all — the previous split's y jumps straight
+    // to it. An empty branch has no code: its split arg dangles to
+    // after-alt instead of pointing at the next branch's code.
+    //
+    // (An earlier version chained splits forward and dangled the last
+    // split's y to after-alt, which created a spurious empty alternative:
+    // `a|b` matched "" — measured 2026-10-21.)
+    let bstarts <&Collection<int>> = new Collection::<int>{};
+    let bempty <&Collection<int>> = new Collection::<int>{};
+    let curpos <int> = pos;
+    let more <bool> = true;
+    while (more && prog.err == 0) {
+        let pc0 <int> = prog.ops.len();
+        let bouts <&ReOuts> = re_wrap(re_new_outs());
+        let f <ReParsed> = re_parse_concat(prog, pchars, plen, curpos, bouts);
+        curpos = f.pos;
+        bstarts.push(f.start);
+        if (prog.ops.len() == pc0) {
+            bempty.push(1);
+        } else {
+            bempty.push(0);
+        }
+        re_outs_append(outs.c, bouts.c);
+        if (curpos < plen && pchars[curpos] == '|') {
+            curpos = curpos + 1;
+        } else {
+            more = false;
+        }
+    }
+    let nb <int> = bstarts.len();
+    let entry <int> = bstarts.get(0);
+    if (nb >= 2) {
+        // Target for "enter branch nb": its start, or DANGLING (-1).
+        let rest <int> = bstarts.get(nb - 1);
+        let rest_dangles <bool> = false;
+        if (bempty.get(nb - 1) == 1) {
+            rest_dangles = true;
+        }
+        let k <int> = nb - 2;
+        while (k >= 0) {
+            let s <int> = re_emit(prog, 3, -1, -1);
+            if (bempty.get(k) == 1) {
+                re_outs_add(outs.c, s, 1);
+            } else {
+                re_patch_single(prog, s, 1, bstarts.get(k));
+            }
+            if (rest_dangles) {
+                re_outs_add(outs.c, s, 2);
+            } else {
+                re_patch_single(prog, s, 2, rest);
+            }
+            rest = s;
+            rest_dangles = false;
+            k = k - 1;
+        }
+        entry = rest;
+    }
+    return ReParsed{pos: curpos, start: entry};
+}
+
+fun re_parse_concat(prog: &ReProg, pchars: [char], plen: int, pos: int, outs: &ReOuts) <ReParsed> {
+    let first <bool> = true;
+    let start <int> = prog.ops.len();
+    let curpos <int> = pos;
+    let prev_outs <&ReOuts> = re_wrap(re_new_outs());
+    let going <bool> = true;
+    while (going && curpos < plen && prog.err == 0) {
+        let c <char> = pchars[curpos];
+        if (c == '|' || c == ')') {
+            going = false;
+        } else {
+            let pouts <&ReOuts> = re_wrap(re_new_outs());
+            let f <ReParsed> = re_parse_piece(prog, pchars, plen, curpos, pouts);
+            curpos = f.pos;
+            if (first) {
+                start = f.start;
+                first = false;
+            } else {
+                re_patch_outs(prog, prev_outs.c, f.start);
+            }
+            if (curpos < plen && pchars[curpos] != '|' && pchars[curpos] != ')') {
+                prev_outs = pouts;
+            } else {
+                re_outs_append(outs.c, pouts.c);
+            }
+        }
+    }
+    return ReParsed{pos: curpos, start: start};
+}
+
+// Duplicate the instruction range [frm, to) (a previously emitted piece)
+// into fresh code, appending the rebased exit jumps (copies of `orig_outs`
+// with pcs shifted by delta) into `outs`. Jump args pointing inside the
+// range are rebased; dangling (-1) args stay dangling.
+fun re_dup_range(prog: &ReProg, frm: int, to: int, orig_outs: &Collection<int>, outs: &Collection<int>) <ReParsed> {
+    let copy_start <int> = prog.ops.len();
+    let delta <int> = copy_start - frm;
+    let pc <int> = frm;
+    while (pc < to) {
+        let op <int> = prog.ops.get(pc);
+        let x <int> = prog.a1.get(pc);
+        let y <int> = prog.a2.get(pc);
+        if (op == 3 || op == 4) {
+            if (x >= frm && x < to) {
+                x = x + delta;
+            }
+            if (y >= frm && y < to) {
+                y = y + delta;
+            }
+        }
+        re_emit(prog, op, x, y);
+        pc = pc + 1;
+    }
+    let i <int> = 0;
+    while (i < orig_outs.len()) {
+        outs.push(orig_outs.get(i) + delta);
+        outs.push(orig_outs.get(i + 1));
+        i = i + 2;
+    }
+    return ReParsed{pos: 0, start: copy_start};
+}
+
+fun re_apply_quant(prog: &ReProg, fstart: int, fouts: &Collection<int>, q: char, lazy: bool, pos: int, outs: &Collection<int>) <ReParsed> {
+    if (q == '*') {
+        let s <int> = re_emit(prog, 3, -1, -1);
+        re_patch_outs(prog, fouts, s);
+        if (lazy) {
+            re_patch_single(prog, s, 2, fstart);
+            re_outs_add(outs, s, 1);
+        } else {
+            re_patch_single(prog, s, 1, fstart);
+            re_outs_add(outs, s, 2);
+        }
+        return ReParsed{pos: pos, start: s};
+    }
+    if (q == '+') {
+        let s <int> = re_emit(prog, 3, -1, -1);
+        re_patch_outs(prog, fouts, s);
+        if (lazy) {
+            re_patch_single(prog, s, 2, fstart);
+            re_outs_add(outs, s, 1);
+        } else {
+            re_patch_single(prog, s, 1, fstart);
+            re_outs_add(outs, s, 2);
+        }
+        return ReParsed{pos: pos, start: fstart};
+    }
+    // q == '?'
+    let s <int> = re_emit(prog, 3, -1, -1);
+    if (lazy) {
+        re_patch_single(prog, s, 2, fstart);
+        re_outs_add(outs, s, 1);
+    } else {
+        re_patch_single(prog, s, 1, fstart);
+        re_outs_add(outs, s, 2);
+    }
+    re_outs_append(outs, fouts);
+    return ReParsed{pos: pos, start: s};
+}
+
+// Try to parse {m}, {m,}, {m,n} at pos (pos is at '{'). On success the
+// repeated fragment's outs are in `outs` and pos is past '}' (and a lazy
+// '?' if present). On failure pos is returned unchanged (so '{' parses as
+// a literal on the next piece iteration) and `outs` is untouched —
+// except for genuine errors, which set prog.err.
+fun re_try_brace(prog: &ReProg, pchars: [char], plen: int, pos: int, fstart: int, fouts: &Collection<int>, outs: &Collection<int>) <ReParsed> {
+    let i <int> = pos + 1;
+    let m <int> = 0;
+    let has_m <bool> = false;
+    while (i < plen && pchars[i] >= '0' && pchars[i] <= '9') {
+        m = m * 10 + (cast<int>(pchars[i]) - 48);
+        has_m = true;
+        i = i + 1;
+    }
+    if (!has_m) {
+        return ReParsed{pos: pos, start: fstart};
+    }
+    let n <int> = m;
+    let unbounded <bool> = false;
+    if (i < plen && pchars[i] == ',') {
+        i = i + 1;
+        if (i < plen && pchars[i] >= '0' && pchars[i] <= '9') {
+            n = 0;
+            while (i < plen && pchars[i] >= '0' && pchars[i] <= '9') {
+                n = n * 10 + (cast<int>(pchars[i]) - 48);
+                i = i + 1;
+            }
+        } else {
+            unbounded = true;
+        }
+    }
+    if (i >= plen || pchars[i] != '}') {
+        return ReParsed{pos: pos, start: fstart};
+    }
+    i = i + 1;
+    let lazy <bool> = false;
+    if (i < plen && pchars[i] == '?') {
+        lazy = true;
+        i = i + 1;
+    }
+    if (!unbounded && n < m) {
+        prog.err = 2;
+        prog.errmsg = "regex: {m,n} with n < m";
+        return ReParsed{pos: pos, start: fstart};
+    }
+    if (m > 32 || (!unbounded && n > 64)) {
+        prog.err = 2;
+        prog.errmsg = "regex: repeat count too large (max {32,64})";
+        return ReParsed{pos: pos, start: fstart};
+    }
+    let body_start <int> = fstart;
+    let body_end <int> = prog.ops.len();
+    if (m == 0 && unbounded) {
+        // {0,} == *
+        let s <int> = re_emit(prog, 3, -1, -1);
+        re_patch_outs(prog, fouts, s);
+        if (lazy) {
+            re_patch_single(prog, s, 2, fstart);
+            re_outs_add(outs, s, 1);
+        } else {
+            re_patch_single(prog, s, 1, fstart);
+            re_outs_add(outs, s, 2);
+        }
+        return ReParsed{pos: i, start: s};
+    }
+    if (m == 0) {
+        // Original body becomes optional copy #1. Exits are tracked in
+        // a local `cur` and appended to `outs` once, at the end.
+        let cur <&Collection<int>> = re_new_outs();
+        let s <int> = re_emit(prog, 3, -1, -1);
+        if (lazy) {
+            re_patch_single(prog, s, 2, fstart);
+            re_outs_add(cur, s, 1);
+        } else {
+            re_patch_single(prog, s, 1, fstart);
+            re_outs_add(cur, s, 2);
+        }
+        re_outs_append(cur, fouts);
+        let start <int> = s;
+        let opt <int> = n - 1;
+        while (opt > 0 && prog.err == 0) {
+            let s2 <int> = re_emit(prog, 3, -1, -1);
+            re_patch_outs(prog, cur, s2);
+            let cpouts <&Collection<int>> = re_new_outs();
+            let cp <ReParsed> = re_dup_range(prog, body_start, body_end, fouts, cpouts);
+            let ncur <&Collection<int>> = re_new_outs();
+            if (lazy) {
+                re_patch_single(prog, s2, 2, cp.start);
+                re_outs_add(ncur, s2, 1);
+            } else {
+                re_patch_single(prog, s2, 1, cp.start);
+                re_outs_add(ncur, s2, 2);
+            }
+            re_outs_append(ncur, cpouts);
+            cur = ncur;
+            opt = opt - 1;
+        }
+        re_outs_append(outs, cur);
+        return ReParsed{pos: i, start: start};
+    }
+    // m >= 1: original body is copy #1, then mandatory copies.
+    // We track the current exit jumps in a local collection `cur`.
+    let cur <&Collection<int>> = re_new_outs();
+    re_outs_append(cur, fouts);
+    let count <int> = 1;
+    while (count < m && prog.err == 0) {
+        let cpouts <&Collection<int>> = re_new_outs();
+        let cp <ReParsed> = re_dup_range(prog, body_start, body_end, fouts, cpouts);
+        re_patch_outs(prog, cur, cp.start);
+        cur = cpouts;
+        count = count + 1;
+    }
+    if (unbounded) {
+        // Star-wrap one fresh copy.
+        let cpouts <&Collection<int>> = re_new_outs();
+        let cp <ReParsed> = re_dup_range(prog, body_start, body_end, fouts, cpouts);
+        re_patch_outs(prog, cur, cp.start);
+        let s <int> = re_emit(prog, 3, -1, -1);
+        re_patch_outs(prog, cpouts, s);
+        if (lazy) {
+            re_patch_single(prog, s, 2, cp.start);
+            re_outs_add(outs, s, 1);
+        } else {
+            re_patch_single(prog, s, 1, cp.start);
+            re_outs_add(outs, s, 2);
+        }
+        return ReParsed{pos: i, start: fstart};
+    }
+    let opt <int> = n - m;
+    while (opt > 0 && prog.err == 0) {
+        let s <int> = re_emit(prog, 3, -1, -1);
+        re_patch_outs(prog, cur, s);
+        let cpouts <&Collection<int>> = re_new_outs();
+        let cp <ReParsed> = re_dup_range(prog, body_start, body_end, fouts, cpouts);
+        let ncur <&Collection<int>> = re_new_outs();
+        if (lazy) {
+            re_patch_single(prog, s, 2, cp.start);
+            re_outs_add(ncur, s, 1);
+        } else {
+            re_patch_single(prog, s, 1, cp.start);
+            re_outs_add(ncur, s, 2);
+        }
+        re_outs_append(ncur, cpouts);
+        cur = ncur;
+        opt = opt - 1;
+    }
+    re_outs_append(outs, cur);
+    return ReParsed{pos: i, start: fstart};
+}
+
+fun re_parse_piece(prog: &ReProg, pchars: [char], plen: int, pos: int, outs: &ReOuts) <ReParsed> {
+    let aouts <&ReOuts> = re_wrap(re_new_outs());
+    let a <ReParsed> = re_parse_atom(prog, pchars, plen, pos, aouts);
+    if (prog.err != 0) {
+        return a;
+    }
+    // Stacked quantifiers (a**, a?*, a{2}{3}, ...) apply left to right,
+    // like most engines. A '?' directly after * + ? is the lazy marker,
+    // not a second quantifier; the loop consumes it as part of its pair.
+    let cur_start <int> = a.start;
+    let cur_outs <&Collection<int>> = re_new_outs();
+    re_outs_append(cur_outs, aouts.c);
+    let curpos <int> = a.pos;
+    let stacking <bool> = true;
+    while (stacking && curpos < plen && prog.err == 0) {
+        let q <char> = pchars[curpos];
+        if (q == '*' || q == '+' || q == '?') {
+            curpos = curpos + 1;
+            let lazy <bool> = false;
+            if (curpos < plen && pchars[curpos] == '?') {
+                lazy = true;
+                curpos = curpos + 1;
+            }
+            let qouts <&Collection<int>> = re_new_outs();
+            let r <ReParsed> = re_apply_quant(prog, cur_start, cur_outs, q, lazy, curpos, qouts);
+            cur_start = r.start;
+            cur_outs = qouts;
+            curpos = r.pos;
+        } else if (q == '{') {
+            let bouts <&Collection<int>> = re_new_outs();
+            let r <ReParsed> = re_try_brace(prog, pchars, plen, curpos, cur_start, cur_outs, bouts);
+            if (prog.err != 0) {
+                return r;
+            }
+            if (r.pos == curpos) {
+                // Not a brace quantifier: leave '{' for the next piece
+                // (it parses as a literal there).
+                stacking = false;
+            } else {
+                cur_start = r.start;
+                cur_outs = bouts;
+                curpos = r.pos;
+            }
+        } else {
+            stacking = false;
+        }
+    }
+    re_outs_append(outs.c, cur_outs);
+    return ReParsed{pos: curpos, start: cur_start};
+}
+
+// Emit a one-instruction piece (CHAR/ANY/CLASS/BOL/EOL/WB/NWB + trailing
+// JMP exit) and return its fragment.
+fun re_emit_piece(prog: &ReProg, op: int, x: int, pos: int, outs: &Collection<int>) <ReParsed> {
+    let pc <int> = re_emit(prog, op, x, 0);
+    let j <int> = re_emit(prog, 4, -1, 0);
+    re_outs_add(outs, j, 1);
+    return ReParsed{pos: pos, start: pc};
+}
+
+fun re_escape_class_id(prog: &ReProg, e: char) <int> {
+    // Returns class id for \d \w \s (positive) or \D \W \S (negated),
+    // or -1 if `e` is not a class escape.
+    if (e == 'd') {
+        let id <int> = re_new_class(prog, 0);
+        re_class_add_digit(prog, id);
+        return id;
+    }
+    if (e == 'D') {
+        let id <int> = re_new_class(prog, 1);
+        re_class_add_digit(prog, id);
+        return id;
+    }
+    if (e == 'w') {
+        let id <int> = re_new_class(prog, 0);
+        re_class_add_word(prog, id);
+        return id;
+    }
+    if (e == 'W') {
+        let id <int> = re_new_class(prog, 1);
+        re_class_add_word(prog, id);
+        return id;
+    }
+    if (e == 's') {
+        let id <int> = re_new_class(prog, 0);
+        re_class_add_space(prog, id);
+        return id;
+    }
+    if (e == 'S') {
+        let id <int> = re_new_class(prog, 1);
+        re_class_add_space(prog, id);
+        return id;
+    }
+    return -1;
+}
+
+// Parse [...] at pos (pos is at '[').
+fun re_parse_class(prog: &ReProg, pchars: [char], plen: int, pos: int, outs: &ReOuts) <ReParsed> {
+    let i <int> = pos + 1;
+    let neg <int> = 0;
+    if (i < plen && pchars[i] == '^') {
+        neg = 1;
+        i = i + 1;
+    }
+    let id <int> = re_new_class(prog, neg);
+    let first <bool> = true;
+    let closed <bool> = false;
+    while (i < plen && !closed && prog.err == 0) {
+        let c <char> = pchars[i];
+        if (c == ']' && !first) {
+            closed = true;
+            i = i + 1;
+        } else {
+            let lo <int> = 0;
+            let is_range_class <bool> = false;
+            if (c == '\\' && i + 1 < plen) {
+                let e <char> = pchars[i + 1];
+                let cid <int> = re_escape_class_id(prog, e);
+                if (e == 'D' || e == 'W' || e == 'S') {
+                    prog.err = 2;
+                    prog.errmsg = "regex: \\D \\W \\S are not supported inside [...]";
+                } else if (cid >= 0) {
+                    // Merge the predefined ranges into this class.
+                    let rs <int> = prog.cls_start.get(cid);
+                    let rn <int> = prog.cls_count.get(cid);
+                    for (let k <int> = 0; k < rn; k++) {
+                        re_class_add(prog, id,
+                                     prog.cls_ranges.get(rs + k * 2),
+                                     prog.cls_ranges.get(rs + k * 2 + 1));
+                    }
+                    is_range_class = true;
+                    i = i + 2;
+                } else if (e == 'n') {
+                    lo = 10;
+                    i = i + 2;
+                } else if (e == 'r') {
+                    lo = 13;
+                    i = i + 2;
+                } else if (e == 't') {
+                    lo = 9;
+                    i = i + 2;
+                } else {
+                    lo = cast<int>(e);
+                    i = i + 2;
+                }
+            } else {
+                lo = cast<int>(c);
+                i = i + 1;
+            }
+            first = false;
+            if (!is_range_class && i < plen && pchars[i] == '-' && i + 1 < plen && pchars[i + 1] != ']') {
+                i = i + 1;
+                let hi <int> = 0;
+                if (pchars[i] == '\\' && i + 1 < plen) {
+                    let e2 <char> = pchars[i + 1];
+                    if (e2 == 'n') {
+                        hi = 10;
+                    } else if (e2 == 'r') {
+                        hi = 13;
+                    } else if (e2 == 't') {
+                        hi = 9;
+                    } else {
+                        hi = cast<int>(e2);
+                    }
+                    i = i + 2;
+                } else {
+                    hi = cast<int>(pchars[i]);
+                    i = i + 1;
+                }
+                if (hi < lo) {
+                    prog.err = 2;
+                    prog.errmsg = "regex: invalid range in [...]";
+                } else {
+                    re_class_add(prog, id, lo, hi);
+                }
+            } else if (!is_range_class) {
+                re_class_add(prog, id, lo, lo);
+            }
+        }
+    }
+    if (prog.err == 0 && !closed) {
+        prog.err = 2;
+        prog.errmsg = "regex: unterminated [";
+    }
+    if (prog.err == 0 && prog.cls_count.get(id) == 0) {
+        prog.err = 2;
+        prog.errmsg = "regex: empty []";
+    }
+    if (prog.err != 0) {
+        return ReParsed{pos: i, start: 0};
+    }
+    return re_emit_piece(prog, 2, id, i, outs.c);
+}
+
+fun re_parse_atom(prog: &ReProg, pchars: [char], plen: int, pos: int, outs: &ReOuts) <ReParsed> {
+    let c <char> = pchars[pos];
+    if (c == '(') {
+        let capturing <bool> = true;
+        let i <int> = pos + 1;
+        if (i < plen && pchars[i] == '?') {
+            if (i + 1 < plen && pchars[i + 1] == ':') {
+                capturing = false;
+                i = i + 2;
+            } else {
+                prog.err = 2;
+                prog.errmsg = "regex: only (?:...) non-capturing groups are supported";
+                return ReParsed{pos: i, start: 0};
+            }
+        }
+        let gidx <int> = 0;
+        if (capturing) {
+            prog.ngroups = prog.ngroups + 1;
+            gidx = prog.ngroups;
+        }
+        let save1 <int> = -1;
+        let bridge <int> = -1;
+        if (capturing) {
+            save1 = re_emit(prog, 5, gidx * 2, 0);
+            // Bridge: SAVE1 falls through here and jumps to the inner
+            // fragment's start. A plain fall-through (SAVE1 -> inner)
+            // is WRONG when the inner pattern is an alternation, whose
+            // entry SPLIT is emitted after its branches (measured
+            // 2026-10-21: `(a|ab)` never matched "ab").
+            bridge = re_emit(prog, 4, -1, 0);
+        }
+        let iouts <&ReOuts> = re_wrap(re_new_outs());
+        let inner <ReParsed> = re_parse_alt(prog, pchars, plen, i, iouts);
+        if (capturing) {
+            re_patch_single(prog, bridge, 1, inner.start);
+        }
+        if (prog.err != 0) {
+            return inner;
+        }
+        if (inner.pos >= plen || pchars[inner.pos] != ')') {
+            prog.err = 2;
+            prog.errmsg = "regex: unbalanced (";
+            return inner;
+        }
+        let after <int> = inner.pos + 1;
+        let j <int> = -1;
+        if (capturing) {
+            let save2 <int> = re_emit(prog, 5, gidx * 2 + 1, 0);
+            re_patch_outs(prog, iouts.c, save2);
+            j = re_emit(prog, 4, -1, 0);
+        } else {
+            j = re_emit(prog, 4, -1, 0);
+            re_patch_outs(prog, iouts.c, j);
+        }
+        re_outs_add(outs.c, j, 1);
+        let start <int> = inner.start;
+        if (capturing) {
+            start = save1;
+        }
+        return ReParsed{pos: after, start: start};
+    }
+    if (c == '[') {
+        return re_parse_class(prog, pchars, plen, pos, outs);
+    }
+    if (c == '.') {
+        return re_emit_piece(prog, 1, 0, pos + 1, outs.c);
+    }
+    if (c == '^') {
+        return re_emit_piece(prog, 6, 0, pos + 1, outs.c);
+    }
+    if (c == '$') {
+        return re_emit_piece(prog, 7, 0, pos + 1, outs.c);
+    }
+    if (c == '\\') {
+        if (pos + 1 >= plen) {
+            prog.err = 2;
+            prog.errmsg = "regex: trailing backslash";
+            return ReParsed{pos: pos, start: 0};
+        }
+        let e <char> = pchars[pos + 1];
+        let cid <int> = re_escape_class_id(prog, e);
+        if (cid >= 0) {
+            return re_emit_piece(prog, 2, cid, pos + 2, outs.c);
+        }
+        if (e == 'n') {
+            return re_emit_piece(prog, 0, 10, pos + 2, outs.c);
+        }
+        if (e == 'r') {
+            return re_emit_piece(prog, 0, 13, pos + 2, outs.c);
+        }
+        if (e == 't') {
+            return re_emit_piece(prog, 0, 9, pos + 2, outs.c);
+        }
+        if (e == 'b') {
+            return re_emit_piece(prog, 8, 0, pos + 2, outs.c);
+        }
+        if (e == 'B') {
+            return re_emit_piece(prog, 9, 0, pos + 2, outs.c);
+        }
+        // Any other escaped char is a literal (covers \\ \. \* \( \[ etc.).
+        return re_emit_piece(prog, 0, cast<int>(e), pos + 2, outs.c);
+    }
+    // Plain literal.
+    return re_emit_piece(prog, 0, cast<int>(c), pos + 1, outs.c);
+}
+
+fun re_new_prog() <&ReProg> {
+    return new ReProg{
+        ops: new Collection::<int>{},
+        a1: new Collection::<int>{},
+        a2: new Collection::<int>{},
+        cls_start: new Collection::<int>{},
+        cls_count: new Collection::<int>{},
+        cls_neg: new Collection::<int>{},
+        cls_ranges: new Collection::<int>{},
+        ngroups: 0,
+        entry: 0,
+        err: 0,
+        errmsg: ""
+    };
+}
+
+fun re_compile(pattern: string) <&ReProg> {
+    let prog <&ReProg> = re_new_prog();
+    let pchars <[char]> = to_chars(pattern);
+    let plen <int> = len(pattern);
+    let touts <&Collection<int>> = re_new_outs();
+    let r <ReParsed> = re_parse_alt(prog, pchars, plen, 0, re_wrap(touts));
+    if (prog.err != 0) {
+        return prog;
+    }
+    if (r.pos < plen) {
+        prog.err = 2;
+        prog.errmsg = "regex: unmatched ')'";
+        return prog;
+    }
+    let mpc <int> = re_emit(prog, 10, 0, 0);
+    re_patch_outs(prog, touts, mpc);
+    // Entry is the top fragment's start, NOT pc 0: a leading quantified
+    // piece (a*, a?b, ...) emits its SPLIT after its body, so the entry
+    // pc is past 0. Starting at 0 would skip the SPLIT and break every
+    // zero-repetition path (measured 2026-10-21: a*b on "b" failed).
+    prog.entry = r.start;
+    return prog;
+}
+
+fun re_compile_checked(pattern: string) <&ReProg> {
+    let prog <&ReProg> = re_compile(pattern);
+    if (prog.err != 0) {
+        blame false, prog.errmsg;
+    }
+    return prog;
+}
+
+// A match result. `spans` is flattened [s0, e0, s1, e1, ...] (group 0 =
+// whole match); -1/-1 for a group that did not participate. Empty when
+// `found` is false.
+#[export]
+pub struct Match {
+    pub:
+        found <bool>,
+        start <int>,
+        end <int>,
+        ngroups <int>,
+        spans <&Collection<int>>,
+}
+
+// Pike VM simulation
+// ---------------------------------------------------------------------------
+
+fun re_spans_copy(src: &Collection<int>) <&Collection<int>> {
+    let out <&Collection<int>> = new Collection::<int>{};
+    for (let i <int> = 0; i < src.len(); i++) {
+        out.push(src.get(i));
+    }
+    return out;
+}
+
+fun re_new_spans(nslots: int, start: int) <&Collection<int>> {
+    let out <&Collection<int>> = new Collection::<int>{};
+    for (let i <int> = 0; i < nslots; i++) {
+        out.push(-1);
+    }
+    out[0] = start;
+    return out;
+}
+
+// Add thread `pc` (plus its zero-width closure) to a thread list.
+// `seen`/`gen` dedup pcs within one closure batch; `spans` is never
+// mutated here (SAVE copies first), so appended threads may share it.
+fun re_add_thread(prog: &ReProg, pcs: &Collection<int>, tspans: &Collection<&Collection<int>>,
+                  pc: int, pos: int, spans: &Collection<int>,
+                  seen: &Collection<int>, gen: int,
+                  tchars: [char], tlen: int) <noret> {
+    if (seen.get(pc) == gen) {
+        return;
+    }
+    seen[pc] = gen;
+    let op <int> = prog.ops.get(pc);
+    if (op == 4) {
+        re_add_thread(prog, pcs, tspans, prog.a1.get(pc), pos, spans, seen, gen, tchars, tlen);
+        return;
+    }
+    if (op == 3) {
+        re_add_thread(prog, pcs, tspans, prog.a1.get(pc), pos, spans, seen, gen, tchars, tlen);
+        re_add_thread(prog, pcs, tspans, prog.a2.get(pc), pos, spans, seen, gen, tchars, tlen);
+        return;
+    }
+    if (op == 5) {
+        let ns <&Collection<int>> = re_spans_copy(spans);
+        ns[prog.a1.get(pc)] = pos;
+        re_add_thread(prog, pcs, tspans, pc + 1, pos, ns, seen, gen, tchars, tlen);
+        return;
+    }
+    if (op == 6) {
+        if (pos == 0) {
+            re_add_thread(prog, pcs, tspans, pc + 1, pos, spans, seen, gen, tchars, tlen);
+        }
+        return;
+    }
+    if (op == 7) {
+        if (pos == tlen) {
+            re_add_thread(prog, pcs, tspans, pc + 1, pos, spans, seen, gen, tchars, tlen);
+        }
+        return;
+    }
+    if (op == 8) {
+        if (re_is_boundary(tchars, tlen, pos)) {
+            re_add_thread(prog, pcs, tspans, pc + 1, pos, spans, seen, gen, tchars, tlen);
+        }
+        return;
+    }
+    if (op == 9) {
+        if (!re_is_boundary(tchars, tlen, pos)) {
+            re_add_thread(prog, pcs, tspans, pc + 1, pos, spans, seen, gen, tchars, tlen);
+        }
+        return;
+    }
+    // CHAR, ANY, CLASS, MATCH: real thread.
+    pcs.push(pc);
+    tspans.push(spans);
+}
+
+fun re_find_match(prog: &ReProg, pcs: &Collection<int>) <int> {
+    for (let i <int> = 0; i < pcs.len(); i++) {
+        if (prog.ops.get(pcs.get(i)) == 10) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Core simulation. `anchored` = full match (only start at 0, only accept
+// at end of text); otherwise leftmost-first search starting at `frm`.
+// Threads are kept in priority order, so the first MATCH found wins.
+// Core simulation. `anchored` = full match (only start at 0, only accept
+// at end of text); otherwise leftmost-first search starting at `frm`.
+//
+// Pike VM match rule (this is the subtle part — an early version returned
+// the first MATCH thread in the list, which broke greedy quantifiers like
+// `\d+` by stopping after one digit):
+//   * Threads are kept in priority order. If the FIRST thread is MATCH,
+//     nothing can beat it: return immediately (this is the lazy case).
+//   * Otherwise, if a MATCH thread exists at rank r, record it, keep only
+//     the r higher-priority threads (they may still extend to a longer
+//     greedy match), drop the rest, and STOP adding new start threads (a
+//     later start can never beat a recorded match). When those threads
+//     die, or input ends, the last recorded match wins.
+//   * A later record always comes from a higher-priority path than the
+//     previous record, so overwriting is correct.
+fun re_run(prog: &ReProg, text: string, anchored: bool, frm: int) <Match> {
+    let tchars <[char]> = to_chars(text);
+    let tlen <int> = len(text);
+    let nslots <int> = (prog.ngroups + 1) * 2;
+    let ninstr <int> = prog.ops.len();
+    let seen <&Collection<int>> = new Collection::<int>{};
+    for (let i <int> = 0; i < ninstr; i++) {
+        seen.push(0);
+    }
+    let gen <int> = 0;
+    let clist <&Collection<int>> = new Collection::<int>{};
+    let cspans <&Collection<&Collection<int>>> = new Collection::<&Collection<int>>{};
+    let result <Match> = Match{found: false, start: -1, end: -1,
+                              ngroups: prog.ngroups, spans: new Collection::<int>{}};
+    let pos <int> = frm;
+    let have_record <bool> = false;
+    let done <bool> = false;
+    while (!done && pos <= tlen) {
+        // Add a start thread: search mode only, and only while no match
+        // has been recorded yet (a later start can never beat one).
+        if ((!anchored && !have_record) || (anchored && pos == 0)) {
+            gen = gen + 1;
+            let s0 <&Collection<int>> = re_new_spans(nslots, pos);
+            re_add_thread(prog, clist, cspans, prog.entry, pos, s0, seen, gen, tchars, tlen);
+        }
+        if (anchored) {
+            // Full match: accept iff some thread accepts exactly at end.
+            if (pos == tlen) {
+                let mi <int> = re_find_match(prog, clist);
+                if (mi >= 0) {
+                    let mspans <&Collection<int>> = re_spans_copy(cspans.get(mi));
+                    mspans[1] = pos;
+                    result = Match{found: true, start: mspans.get(0), end: pos,
+                                   ngroups: prog.ngroups, spans: mspans};
+                }
+                done = true;
+            }
+        } else if (have_record && clist.len() == 0) {
+            // All higher-priority threads died: the record stands.
+            done = true;
+        } else {
+            let mi <int> = re_find_match(prog, clist);
+            if (mi >= 0) {
+                let mspans <&Collection<int>> = re_spans_copy(cspans.get(mi));
+                mspans[1] = pos;
+                if (mi == 0) {
+                    result = Match{found: true, start: mspans.get(0), end: pos,
+                                   ngroups: prog.ngroups, spans: mspans};
+                    done = true;
+                } else {
+                    result = Match{found: true, start: mspans.get(0), end: pos,
+                                   ngroups: prog.ngroups, spans: mspans};
+                    have_record = true;
+                    let nclist <&Collection<int>> = new Collection::<int>{};
+                    let ncspans <&Collection<&Collection<int>>> = new Collection::<&Collection<int>>{};
+                    for (let k <int> = 0; k < mi; k++) {
+                        nclist.push(clist.get(k));
+                        ncspans.push(cspans.get(k));
+                    }
+                    clist = nclist;
+                    cspans = ncspans;
+                }
+            }
+        }
+        if (!done && pos < tlen) {
+            let nlist <&Collection<int>> = new Collection::<int>{};
+            let nspans <&Collection<&Collection<int>>> = new Collection::<&Collection<int>>{};
+            gen = gen + 1;
+            let code <int> = cast<int>(tchars[pos]);
+            for (let ti <int> = 0; ti < clist.len(); ti++) {
+                let pc <int> = clist.get(ti);
+                let op <int> = prog.ops.get(pc);
+                if (op == 0 && code == prog.a1.get(pc)) {
+                    re_add_thread(prog, nlist, nspans, pc + 1, pos + 1, cspans.get(ti), seen, gen, tchars, tlen);
+                } else if (op == 1 && code != 10) {
+                    re_add_thread(prog, nlist, nspans, pc + 1, pos + 1, cspans.get(ti), seen, gen, tchars, tlen);
+                } else if (op == 2 && re_class_matches(prog, prog.a1.get(pc), code)) {
+                    re_add_thread(prog, nlist, nspans, pc + 1, pos + 1, cspans.get(ti), seen, gen, tchars, tlen);
+                }
+            }
+            clist = nlist;
+            cspans = nspans;
+        }
+        pos = pos + 1;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// String building (heap discipline: concat results are fresh; free the old
+// left side after each append, and free heap pieces after appending).
+// ---------------------------------------------------------------------------
+
+fun re_str_new() <string> {
+    return re_calloc(cast<ulong>(1), cast<ulong>(1));
+}
+
+fun re_str_add(out: string, piece: string) <string> {
+    let joined <string> = concat(out, piece);
+    re_cfree(out);
+    return joined;
+}
+
+// Expand $0..$9 (group text) and $$ (literal $) in a replacement string.
+// A $ not followed by a digit or $ is left literal.
+fun re_expand_repl(repl: string, m: &Match, text: string) <string> {
+    let out <string> = re_str_new();
+    let rchars <[char]> = to_chars(repl);
+    let rlen <int> = len(repl);
+    let i <int> = 0;
+    while (i < rlen) {
+        let c <char> = rchars[i];
+        if (c == '$' && i + 1 < rlen) {
+            let d <char> = rchars[i + 1];
+            if (d == '$') {
+                out = re_str_add(out, "$");
+                i = i + 2;
+            } else if (d >= '0' && d <= '9') {
+                let g <int> = cast<int>(d) - 48;
+                let s <int> = regex_group_start(m, g);
+                let e <int> = regex_group_end(m, g);
+                if (s >= 0 && e >= s) {
+                    let piece <string> = substr(text, s, e - s);
+                    out = re_str_add(out, piece);
+                    re_cfree(piece);
+                }
+                i = i + 2;
+            } else {
+                let piece <string> = substr(repl, i, 1);
+                out = re_str_add(out, piece);
+                re_cfree(piece);
+                i = i + 1;
+            }
+        } else {
+            let piece <string> = substr(repl, i, 1);
+            out = re_str_add(out, piece);
+            re_cfree(piece);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// True when `pattern` compiles (no blame — use this to pre-check
+// user-supplied patterns before calling the matching functions).
+#[export]
+pub fun regex_valid(pattern: string) <bool> {
+    let prog <&ReProg> = re_compile(pattern);
+    return prog.err == 0;
+}
+
+// True when `pattern` matches the ENTIRE `text` (anchored both ends).
+// Invalid patterns blame (programmer error — pre-check with regex_valid).
+#[export]
+pub fun regex_is_match(pattern: string, text: string) <bool> {
+    let prog <&ReProg> = re_compile_checked(pattern);
+    let m <Match> = re_run(prog, text, true, 0);
+    return m.found;
+}
+
+// First (leftmost-first) match anywhere in `text`, or found=false.
+#[export]
+pub fun regex_search(pattern: string, text: string) <Match> {
+    return regex_search_from(pattern, text, 0);
+}
+
+// First match at or after byte index `frm` (clamped to the text bounds).
+#[export]
+pub fun regex_search_from(pattern: string, text: string, frm: int) <Match> {
+    let prog <&ReProg> = re_compile_checked(pattern);
+    let tlen <int> = len(text);
+    let f <int> = frm;
+    if (f < 0) {
+        f = 0;
+    }
+    if (f > tlen) {
+        f = tlen;
+    }
+    return re_run(prog, text, false, f);
+}
+
+#[export]
+pub fun regex_group_count(m: &Match) <int> {
+    return m.ngroups;
+}
+
+// Start index of group `i` (0 = whole match), or -1 when the match failed
+// or the group did not participate.
+#[export]
+pub fun regex_group_start(m: &Match, i: int) <int> {
+    if (!m.found) {
+        return -1;
+    }
+    if (i < 0 || i > m.ngroups) {
+        return -1;
+    }
+    return m.spans.get(i * 2);
+}
+
+#[export]
+pub fun regex_group_end(m: &Match, i: int) <int> {
+    if (!m.found) {
+        return -1;
+    }
+    if (i < 0 || i > m.ngroups) {
+        return -1;
+    }
+    return m.spans.get(i * 2 + 1);
+}
+
+// Text of group `i` (0 = whole match). Heap-allocated — free with
+// strings::std.free_str when done. "" when the group did not participate.
+#[export]
+pub fun regex_group_text(m: &Match, text: string, i: int) <string> {
+    let s <int> = regex_group_start(m, i);
+    let e <int> = regex_group_end(m, i);
+    if (s < 0 || e < s) {
+        return re_str_new();
+    }
+    return substr(text, s, e - s);
+}
+
+// Text of the whole match. Heap-allocated — free with free_str when done.
+#[export]
+pub fun regex_match_text(m: &Match, text: string) <string> {
+    if (!m.found) {
+        return re_str_new();
+    }
+    return substr(text, m.start, m.end - m.start);
+}
+
+// All non-overlapping matches as flattened [start, end, ...] pairs.
+// Empty matches advance by one char (no infinite loop, no duplicates).
+#[export]
+pub fun regex_find_all(pattern: string, text: string) <&Collection<int>> {
+    let prog <&ReProg> = re_compile_checked(pattern);
+    let out <&Collection<int>> = new Collection::<int>{};
+    let tlen <int> = len(text);
+    let frm <int> = 0;
+    let going <bool> = true;
+    while (going) {
+        let m <Match> = re_run(prog, text, false, frm);
+        if (!m.found) {
+            going = false;
+        } else {
+            out.push(m.start);
+            out.push(m.end);
+            if (m.end == m.start) {
+                frm = m.end + 1;
+                if (frm > tlen) {
+                    going = false;
+                }
+            } else {
+                frm = m.end;
+            }
+        }
+    }
+    return out;
+}
+
+// Replace the first match with `repl` ($0..$9, $$ supported).
+// Heap-allocated result — free with free_str when done.
+#[export]
+pub fun regex_replace_first(pattern: string, text: string, repl: string) <string> {
+    let prog <&ReProg> = re_compile_checked(pattern);
+    let m <Match> = re_run(prog, text, false, 0);
+    if (!m.found) {
+        return substr(text, 0, len(text));
+    }
+    let out <string> = re_str_new();
+    if (m.start > 0) {
+        let gap <string> = substr(text, 0, m.start);
+        out = re_str_add(out, gap);
+        re_cfree(gap);
+    }
+    let rep <string> = re_expand_repl(repl, &m, text);
+    out = re_str_add(out, rep);
+    re_cfree(rep);
+    let tlen <int> = len(text);
+    if (m.end < tlen) {
+        let tail <string> = substr(text, m.end, tlen - m.end);
+        out = re_str_add(out, tail);
+        re_cfree(tail);
+    }
+    return out;
+}
+
+// Replace all non-overlapping matches with `repl` ($0..$9, $$ supported).
+// Empty matches consume one char (so `x*` style replacements terminate).
+// Heap-allocated result — free with free_str when done.
+#[export]
+pub fun regex_replace_all(pattern: string, text: string, repl: string) <string> {
+    let prog <&ReProg> = re_compile_checked(pattern);
+    let tlen <int> = len(text);
+    let out <string> = re_str_new();
+    let last <int> = 0;
+    let frm <int> = 0;
+    let going <bool> = true;
+    while (going) {
+        let m <Match> = re_run(prog, text, false, frm);
+        if (!m.found) {
+            going = false;
+        } else {
+            if (m.start > last) {
+                let gap <string> = substr(text, last, m.start - last);
+                out = re_str_add(out, gap);
+                re_cfree(gap);
+            }
+            let rep <string> = re_expand_repl(repl, &m, text);
+            out = re_str_add(out, rep);
+            re_cfree(rep);
+            if (m.end == m.start) {
+                if (m.start < tlen) {
+                    let ch <string> = substr(text, m.start, 1);
+                    out = re_str_add(out, ch);
+                    re_cfree(ch);
+                    last = m.start + 1;
+                    frm = m.start + 1;
+                } else {
+                    last = m.end;
+                    going = false;
+                }
+            } else {
+                last = m.end;
+                frm = m.end;
+            }
+        }
+    }
+    if (last < tlen) {
+        let tail <string> = substr(text, last, tlen - last);
+        out = re_str_add(out, tail);
+        re_cfree(tail);
+    }
+    return out;
+}
+
+// Split `text` on matches of `pattern` (empty matches are skipped, not
+// split on). Parts are substrings — free each with free_str when done.
+#[export]
+pub fun regex_split(pattern: string, text: string) <&Collection<string>> {
+    let prog <&ReProg> = re_compile_checked(pattern);
+    let parts <&Collection<string>> = new Collection::<string>{};
+    let tlen <int> = len(text);
+    let last <int> = 0;
+    let frm <int> = 0;
+    let going <bool> = true;
+    while (going) {
+        let m <Match> = re_run(prog, text, false, frm);
+        if (!m.found) {
+            going = false;
+        } else if (m.end == m.start) {
+            frm = m.end + 1;
+            if (frm > tlen) {
+                going = false;
+            }
+        } else {
+            parts.push(substr(text, last, m.start - last));
+            last = m.end;
+            frm = m.end;
+        }
+    }
+    parts.push(substr(text, last, tlen - last));
+    return parts;
+}
+
+}

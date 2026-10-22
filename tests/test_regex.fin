@@ -1,0 +1,340 @@
+// Tests for regex.
+//
+// Run: finc -I src tests/test_regex.fin -o test_regex && ./test_regex
+// Every assert_* blames (aborts, non-zero exit) on failure; a clean run
+// printing ALL TESTS PASSED means every check below passed.
+import { Match, regex_valid, regex_is_match, regex_search,
+         regex_search_from, regex_find_all, regex_replace_first,
+         regex_replace_all, regex_split, regex_group_count,
+         regex_group_start, regex_group_end, regex_group_text,
+         regex_match_text } from regex::fin;
+import { assert_true, assert_false, assert_eq_int, assert_eq_string } from testing::std;
+import { Collection } from collection::std;
+import { free_str, repeat, len } from strings::std;
+
+fun check_match_text(m: &Match, text: string, expected: string, label: string) <noret> {
+    let got <string> = regex_match_text(m, text);
+    assert_eq_string(got, expected, label);
+    free_str(got);
+}
+
+fun check_group(m: &Match, text: string, i: int, expected: string, label: string) <noret> {
+    let got <string> = regex_group_text(m, text, i);
+    assert_eq_string(got, expected, label);
+    free_str(got);
+}
+
+fun check_is_match() <noret> {
+    // Literals and anchors.
+    assert_true(regex_is_match("hello", "hello"), "literal");
+    assert_false(regex_is_match("hello", "hell"), "literal short");
+    assert_false(regex_is_match("hello", "helloo"), "literal long");
+    assert_true(regex_is_match("", ""), "empty pattern empty text");
+    assert_false(regex_is_match("", "x"), "empty pattern nonempty text");
+    assert_true(regex_is_match("^abc$", "abc"), "anchors");
+    assert_false(regex_is_match("^abc$", "xabc"), "caret blocks prefix");
+    assert_false(regex_is_match("^abc$", "abcx"), "dollar blocks suffix");
+    assert_true(regex_is_match("abc", "abc"), "unanchored full ok");
+    // Dot.
+    assert_true(regex_is_match("h.llo", "hello"), "dot");
+    assert_false(regex_is_match("h.llo", "hllo"), "dot needs a char");
+    assert_false(regex_is_match(".", "\n"), "dot excludes newline");
+    // Greedy quantifiers.
+    assert_true(regex_is_match("a*b", "aaab"), "star");
+    assert_true(regex_is_match("a*b", "b"), "star zero");
+    assert_true(regex_is_match("a+", "aaa"), "plus");
+    assert_false(regex_is_match("a+", ""), "plus needs one");
+    assert_true(regex_is_match("colou?r", "color"), "question absent");
+    assert_true(regex_is_match("colou?r", "colour"), "question present");
+    assert_true(regex_is_match("a*", ""), "star empty");
+    assert_true(regex_is_match("a*ab", "aab"), "star then literal");
+    assert_true(regex_is_match("(ab)+", "ababab"), "group plus");
+    assert_false(regex_is_match("(ab)+", "aba"), "group plus partial");
+    assert_true(regex_is_match("(a|ab)*", "ab"), "group star alt completeness");
+    assert_true(regex_is_match("(a|ab)*", "aab"), "group star alt 2");
+    assert_true(regex_is_match("a**", "aaa"), "double star tolerated");
+    // Lazy quantifiers (same full-match language, different search spans).
+    assert_true(regex_is_match("a+?", "aaa"), "lazy plus full");
+    assert_true(regex_is_match("a*?", ""), "lazy star empty");
+    assert_true(regex_is_match("a??", ""), "lazy question empty");
+    // Classes.
+    assert_true(regex_is_match("[a-z]+", "abcxyz"), "class range");
+    assert_false(regex_is_match("[a-z]+", "abc1"), "class range rejects digit");
+    assert_true(regex_is_match("[^0-9]+", "abc"), "negated class");
+    assert_false(regex_is_match("[^0-9]+", "ab1"), "negated class rejects");
+    assert_true(regex_is_match("[abc]+", "cab"), "class set");
+    assert_true(regex_is_match("[]a]+", "]a]"), "] first is literal");
+    assert_true(regex_is_match("[a-]+", "a-a"), "dash last is literal");
+    assert_true(regex_is_match("[-a]+", "-a-"), "dash first is literal");
+    assert_true(regex_is_match("[a-cx-z]+", "abxz"), "two ranges");
+    assert_true(regex_is_match("[\\d]+", "012"), "digit escape in class");
+    assert_true(regex_is_match("[\\w]+", "a_1"), "word escape in class");
+    assert_true(regex_is_match("[a-z\\d]+", "ab12"), "range plus escape in class");
+    // Predefined escapes.
+    assert_true(regex_is_match("\\d+", "123"), "digit");
+    assert_false(regex_is_match("\\d+", "12a"), "digit rejects letter");
+    assert_true(regex_is_match("\\D+", "abc"), "non-digit");
+    assert_true(regex_is_match("\\w+", "hi_2"), "word");
+    assert_true(regex_is_match("\\W+", "!!"), "non-word");
+    assert_true(regex_is_match("\\s", " "), "space");
+    assert_true(regex_is_match("\\s", "\t"), "tab is space");
+    assert_true(regex_is_match("\\S+", "ab"), "non-space");
+    assert_true(regex_is_match("a\\nb", "a\nb"), "newline escape");
+    assert_true(regex_is_match("a\\tb", "a\tb"), "tab escape");
+    assert_true(regex_is_match("a\\rb", "a\rb"), "cr escape");
+    assert_true(regex_is_match("\\.", "."), "escaped dot");
+    assert_true(regex_is_match("a\\.b", "a.b"), "escaped dot mid");
+    assert_false(regex_is_match("a\\.b", "axb"), "escaped dot not wildcard");
+    assert_true(regex_is_match("\\(", "("), "escaped paren");
+    assert_true(regex_is_match("a\\*b", "a*b"), "escaped star");
+    assert_true(regex_is_match("\\\\", "\\"), "escaped backslash");
+    // Alternation.
+    assert_true(regex_is_match("cat|dog", "dog"), "alt second");
+    assert_true(regex_is_match("cat|dog", "cat"), "alt first");
+    assert_false(regex_is_match("cat|dog", "bird"), "alt neither");
+    assert_true(regex_is_match("a|", ""), "empty branch right");
+    assert_true(regex_is_match("|a", ""), "empty branch left");
+    assert_true(regex_is_match("a|b|c", "b"), "three branches");
+    assert_true(regex_is_match("(ab|a)b", "ab"), "alt in group");
+    assert_true(regex_is_match("ab|a", "ab"), "alt longer first");
+    // Word boundary.
+    assert_true(regex_is_match("\\bfoo\\b", "foo"), "word boundary full");
+    assert_true(regex_is_match("foo\\b", "foo"), "boundary at end");
+    assert_false(regex_is_match("foo\\b", "foobar"), "no boundary mid-word");
+    assert_true(regex_is_match("foo\\Bbar", "foobar"), "non-boundary mid-word");
+    // Bounded repetition.
+    assert_true(regex_is_match("a{3}", "aaa"), "brace exact");
+    assert_false(regex_is_match("a{3}", "aa"), "brace exact short");
+    assert_false(regex_is_match("a{3}", "aaaa"), "brace exact long");
+    assert_true(regex_is_match("a{2,4}", "aaa"), "brace range mid");
+    assert_true(regex_is_match("a{2,4}", "aa"), "brace range low");
+    assert_true(regex_is_match("a{2,4}", "aaaa"), "brace range high");
+    assert_false(regex_is_match("a{2,4}", "aaaaa"), "brace range over");
+    assert_true(regex_is_match("a{2,}", "aaaaa"), "brace open");
+    assert_false(regex_is_match("a{2,}", "a"), "brace open short");
+    assert_true(regex_is_match("a{0,2}", ""), "brace zero low");
+    assert_true(regex_is_match("a{0,2}", "aa"), "brace zero high");
+    assert_true(regex_is_match("(ab){2}", "abab"), "brace on group");
+    assert_true(regex_is_match("a{0}", ""), "brace zero exact");
+    assert_true(regex_is_match("a{2,3}?", "aa"), "lazy brace");
+    assert_true(regex_is_match("a{1,2}b", "aab"), "brace then literal");
+    assert_true(regex_is_match("a{", "a{"), "bad brace is literal");
+    assert_true(regex_is_match("a{2", "a{2"), "unterminated brace literal");
+    // Non-capturing groups.
+    assert_true(regex_is_match("(?:ab)+", "abab"), "non-capturing plus");
+    assert_true(regex_is_match("(?:a|b)+", "abba"), "non-capturing alt");
+}
+
+fun check_search() <noret> {
+    let m <Match> = regex_search("world", "hello world");
+    assert_true(m.found, "search found");
+    assert_eq_int(m.start, 6, "search start");
+    assert_eq_int(m.end, 11, "search end");
+    check_match_text(&m, "hello world", "world", "search whole text");
+
+    let m2 <Match> = regex_search("xyz", "hello world");
+    assert_false(m2.found, "search missing");
+    assert_eq_int(regex_group_start(&m2, 0), -1, "missing group start -1");
+    assert_eq_int(regex_group_end(&m2, 0), -1, "missing group end -1");
+    check_group(&m2, "hello world", 0, "", "missing group text empty");
+
+    // Leftmost start wins over a later longer match.
+    let m3 <Match> = regex_search("b+", "aabbb");
+    assert_eq_int(m3.start, 2, "leftmost start");
+    assert_eq_int(m3.end, 5, "greedy extends");
+
+    // Lazy search stops at the first possible end.
+    let m4 <Match> = regex_search("a+?", "aaa");
+    assert_eq_int(m4.start, 0, "lazy start");
+    assert_eq_int(m4.end, 1, "lazy end");
+
+    // Greedy search takes the longest from the leftmost start.
+    let m5 <Match> = regex_search("a+", "aaa");
+    assert_eq_int(m5.start, 0, "greedy start");
+    assert_eq_int(m5.end, 3, "greedy end");
+
+    // Leftmost-first alternation: first branch wins even if shorter.
+    let m6 <Match> = regex_search("(a|ab)(b|c)", "abc");
+    assert_eq_int(m6.start, 0, "alt priority start");
+    assert_eq_int(m6.end, 2, "alt priority end");
+    check_group(&m6, "abc", 1, "a", "alt priority group 1");
+    check_group(&m6, "abc", 2, "b", "alt priority group 2");
+
+    // Longer first branch wins when listed first.
+    let m7 <Match> = regex_search("(ab|a)(b|c)", "abc");
+    assert_eq_int(m7.end, 3, "alt longer first end");
+    check_group(&m7, "abc", 1, "ab", "alt longer first group 1");
+
+    // Nested group numbering by opening paren.
+    let m8 <Match> = regex_search("((a)(b))", "ab");
+    assert_eq_int(regex_group_count(&m8), 3, "nested group count");
+    check_group(&m8, "ab", 1, "ab", "nested group 1");
+    check_group(&m8, "ab", 2, "a", "nested group 2");
+    check_group(&m8, "ab", 3, "b", "nested group 3");
+
+    // Groups: phone-number style.
+    let m9 <Match> = regex_search("(\\d+)-(\\d+)", "call 555-1234 now");
+    assert_eq_int(m9.start, 5, "phone start");
+    assert_eq_int(m9.end, 13, "phone end");
+    check_group(&m9, "call 555-1234 now", 1, "555", "phone group 1");
+    check_group(&m9, "call 555-1234 now", 2, "1234", "phone group 2");
+
+    // Unmatched alternative group reports -1 / "".
+    let m10 <Match> = regex_search("(a)|(b)", "b");
+    assert_eq_int(regex_group_start(&m10, 1), -1, "unmatched group start");
+    assert_eq_int(regex_group_end(&m10, 1), -1, "unmatched group end");
+    check_group(&m10, "b", 1, "", "unmatched group text");
+    check_group(&m10, "b", 2, "b", "matched alternative group");
+
+    // search_from clamps and skips earlier matches.
+    let m11 <Match> = regex_search_from("a", "banana", 3);
+    assert_eq_int(m11.start, 3, "search_from start");
+    let m12 <Match> = regex_search_from("a", "banana", 99);
+    assert_false(m12.found, "search_from past end");
+    let m13 <Match> = regex_search_from("a", "banana", -5);
+    assert_eq_int(m13.start, 1, "search_from negative clamps");
+
+    // Anchors inside search.
+    let m14 <Match> = regex_search("^b", "abc");
+    assert_false(m14.found, "caret search rejects mid");
+    let m15 <Match> = regex_search("^a", "abc");
+    assert_true(m15.found, "caret search accepts start");
+    let m16 <Match> = regex_search("c$", "abc");
+    assert_true(m16.found, "dollar search accepts end");
+    let m17 <Match> = regex_search("b$", "abc");
+    assert_false(m17.found, "dollar search rejects mid");
+
+    // Empty pattern matches empty at 0.
+    let m18 <Match> = regex_search("", "abc");
+    assert_true(m18.found, "empty pattern search");
+    assert_eq_int(m18.start, 0, "empty pattern start");
+    assert_eq_int(m18.end, 0, "empty pattern end");
+
+    // Star of empty-width: finds empty at 0, not a later char.
+    let m19 <Match> = regex_search("x*", "abc");
+    assert_eq_int(m19.start, 0, "star empty start");
+    assert_eq_int(m19.end, 0, "star empty end");
+}
+
+fun check_find_all() <noret> {
+    let all <&Collection<int>> = regex_find_all("\\d+", "a1bb22ccc333");
+    assert_eq_int(all.len(), 6, "find_all pair count");
+    assert_eq_int(all.get(0), 1, "find_all 1 start");
+    assert_eq_int(all.get(1), 2, "find_all 1 end");
+    assert_eq_int(all.get(2), 4, "find_all 2 start");
+    assert_eq_int(all.get(3), 6, "find_all 2 end");
+    assert_eq_int(all.get(4), 9, "find_all 3 start");
+    assert_eq_int(all.get(5), 12, "find_all 3 end");
+
+    let none <&Collection<int>> = regex_find_all("z+", "abc");
+    assert_eq_int(none.len(), 0, "find_all none");
+
+    // Empty matches advance by one (no duplicates, no hang).
+    let empt <&Collection<int>> = regex_find_all("x*", "ab");
+    assert_eq_int(empt.len(), 6, "find_all empty count");
+    assert_eq_int(empt.get(0), 0, "find_all empty 1");
+    assert_eq_int(empt.get(2), 1, "find_all empty 2");
+    assert_eq_int(empt.get(4), 2, "find_all empty 3");
+}
+
+fun check_replace() <noret> {
+    let r1 <string> = regex_replace_first("\\d+", "a12b34", "N");
+    assert_eq_string(r1, "aNb34", "replace first");
+    free_str(r1);
+
+    let r2 <string> = regex_replace_all("\\d+", "a12b34", "N");
+    assert_eq_string(r2, "aNbN", "replace all");
+    free_str(r2);
+
+    let r3 <string> = regex_replace_all("(\\d+)-(\\d+)", "call 555-1234", "$2/$1");
+    assert_eq_string(r3, "call 1234/555", "replace group refs");
+    free_str(r3);
+
+    let r4 <string> = regex_replace_all("a", "banana", "$$");
+    assert_eq_string(r4, "b$n$n$", "replace dollar escape");
+    free_str(r4);
+
+    let r5 <string> = regex_replace_all("z+", "abc", "Q");
+    assert_eq_string(r5, "abc", "replace no match passthrough");
+    free_str(r5);
+
+    // Unmatched group expands to empty.
+    let r6 <string> = regex_replace_all("(a)|(b)", "b", "[$1][$2]");
+    assert_eq_string(r6, "[][b]", "replace unmatched group empty");
+    free_str(r6);
+
+    // Empty-match replacement consumes one char (terminates, keeps text).
+    let r7 <string> = regex_replace_all("x*", "ab", "Y");
+    assert_eq_string(r7, "YaYbY", "replace empty matches");
+    free_str(r7);
+
+    // Whole-match $0.
+    let r8 <string> = regex_replace_all("\\w+", "hi there", "<$0>");
+    assert_eq_string(r8, "<hi> <there>", "replace whole match");
+    free_str(r8);
+}
+
+fun check_split() <noret> {
+    let p1 <&Collection<string>> = regex_split(",", "a,b,,c");
+    assert_eq_int(p1.len(), 4, "split count");
+    assert_eq_string(p1.get(0), "a", "split 0");
+    assert_eq_string(p1.get(1), "b", "split 1");
+    assert_eq_string(p1.get(2), "", "split empty middle");
+    assert_eq_string(p1.get(3), "c", "split 3");
+    for (let i <int> = 0; i < p1.len(); i++) {
+        free_str(p1.get(i));
+    }
+
+    let p2 <&Collection<string>> = regex_split("\\s+", "one  two\tthree");
+    assert_eq_int(p2.len(), 3, "split spaces count");
+    assert_eq_string(p2.get(0), "one", "split spaces 0");
+    assert_eq_string(p2.get(2), "three", "split spaces 2");
+    for (let i <int> = 0; i < p2.len(); i++) {
+        free_str(p2.get(i));
+    }
+
+    let p3 <&Collection<string>> = regex_split("z", "abc");
+    assert_eq_int(p3.len(), 1, "split no match count");
+    assert_eq_string(p3.get(0), "abc", "split no match whole");
+    free_str(p3.get(0));
+}
+
+fun check_valid() <noret> {
+    assert_true(regex_valid("abc"), "valid literal");
+    assert_true(regex_valid("(a|b)*c?"), "valid groups");
+    assert_true(regex_valid("[a-z\\d]+"), "valid class");
+    assert_true(regex_valid("a{2,3}"), "valid brace");
+    assert_true(regex_valid(""), "valid empty");
+    assert_false(regex_valid("a(b"), "invalid unbalanced open");
+    assert_false(regex_valid("a)b"), "invalid unbalanced close");
+    assert_false(regex_valid("a["), "invalid unterminated class");
+    assert_false(regex_valid("[z-a]"), "invalid reversed range");
+    assert_false(regex_valid("a{3,2}"), "invalid brace order");
+    assert_false(regex_valid("a{100}"), "invalid brace too large");
+    assert_false(regex_valid("(?=a)"), "invalid lookahead");
+    assert_false(regex_valid("a\\"), "invalid trailing backslash");
+    assert_false(regex_valid("[\\D]"), "invalid neg escape in class");
+    assert_false(regex_valid("[]"), "invalid empty class");
+}
+
+fun check_catastrophic() <noret> {
+    // (a+)+$ on 30 a's + b: backtrackers explode exponentially; the Pike
+    // VM stays linear. This just has to return (quickly) with no match.
+    let text <string> = repeat("a", 30);
+    assert_false(regex_is_match("(a+)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"), "nested plus no match");
+    assert_false(regex_is_match("(a|aa)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"), "nested alt no match");
+    assert_true(regex_is_match("(a+)+$", text), "nested plus on a-run matches");
+    assert_true(regex_is_match("(a+)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "nested plus matches a-run");
+    free_str(text);
+}
+
+fun main() <noret> {
+    check_is_match();
+    check_search();
+    check_find_all();
+    check_replace();
+    check_split();
+    check_valid();
+    check_catastrophic();
+    printf("ALL TESTS PASSED\n");
+}

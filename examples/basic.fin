@@ -1,0 +1,45 @@
+// regex example: parse log lines, find IPs, redact, and reformat.
+//
+// Run: finc -I src examples/basic.fin -o example_basic && ./example_basic
+import { Match, regex_search, regex_find_all, regex_replace_all,
+         regex_group_text } from regex::fin;
+import { Collection } from collection::std;
+import { free_str, substr } from strings::std;
+
+fun main() <noret> {
+    let log <string> = "2026-10-21 09:12:01 INFO  user=alice ip=10.0.0.7 ok\n";
+    let log2 <string> = "2026-10-21 09:12:02 ERROR user=bob ip=10.0.0.9 FAIL\n";
+
+    // 1. Extract fields with capture groups.
+    let m <Match> = regex_search("(\\d{4}-\\d{2}-\\d{2}) (\\d{2}:\\d{2}:\\d{2}) (INFO|ERROR|WARN)", log);
+    if (m.found) {
+        let date <string> = regex_group_text(&m, log, 1);
+        let time <string> = regex_group_text(&m, log, 2);
+        let level <string> = regex_group_text(&m, log, 3);
+        printf("date=%s time=%s level=%s\n", date, time, level);
+        free_str(date);
+        free_str(time);
+        free_str(level);
+    }
+
+    // 2. Find all IP addresses (spans come back as start/end pairs).
+    let ips <&Collection<int>> = regex_find_all("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}", log2);
+    printf("found %d ip(s):\n", ips.len() / 2);
+    for (let i <int> = 0; i < ips.len(); i = i + 2) {
+        let s <int> = ips.get(i);
+        let e <int> = ips.get(i + 1);
+        let ip <string> = substr(log2, s, e - s);
+        printf("  %s at (%d,%d)\n", ip, s, e);
+        free_str(ip);
+    }
+
+    // 3. Redact IPs with a replacement.
+    let redacted <string> = regex_replace_all("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}", log2, "[IP]");
+    printf("redacted: %s", redacted);
+    free_str(redacted);
+
+    // 4. Reformat key=value pairs with group references.
+    let nice <string> = regex_replace_all("(\\w+)=(\\S+)", log, "$1: $2;");
+    printf("reformatted: %s", nice);
+    free_str(nice);
+}
